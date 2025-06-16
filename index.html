@@ -1,0 +1,877 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, orderBy } from 'firebase/firestore';
+
+// Define Firebase configuration and app ID from global variables
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase App
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// Main App Component
+const App = () => {
+    const [userId, setUserId] = useState(null);
+    const [isAuthenticated, setIsAuthenticated] = useState(false);
+    const [isLoading, setIsLoading] = useState(true);
+    const [exchangeRate, setExchangeRate] = useState(() => {
+        // Initialize exchange rate from localStorage if available, otherwise default
+        const savedRate = localStorage.getItem('exchangeRate');
+        return savedRate ? parseFloat(savedRate) : 36.5; // Default rate for Venezuela, users should update
+    });
+    const [sales, setSales] = useState([]);
+    const [expenses, setExpenses] = useState([]);
+
+    // Form states for sales
+    const [saleDate, setSaleDate] = useState('');
+    const [saleProduct, setSaleProduct] = useState('');
+    const [saleQuantity, setSaleQuantity] = useState('');
+    const [saleAmount, setSaleAmount] = useState('');
+    const [saleCurrency, setSaleCurrency] = useState('USD');
+
+    // Form states for expenses
+    const [expenseDate, setExpenseDate] = useState('');
+    const [expenseCategory, setExpenseCategory] = useState('');
+    const [expenseAmount, setExpenseAmount] = useState('');
+    const [expenseCurrency, setExpenseCurrency] = useState('USD');
+
+    // State for user messages/alerts
+    const [message, setMessage] = useState('');
+    const [messageType, setMessageType] = useState(''); // 'success' or 'error'
+
+    // State for LLM generated sales insights
+    const [salesInsights, setSalesInsights] = useState('');
+    const [isGeneratingInsights, setIsGeneratingInsights] = useState(false);
+
+    // States for Product Description Generator
+    const [productKeywords, setProductKeywords] = useState('');
+    const [productDescription, setProductDescription] = useState('');
+    const [isGeneratingDescription, setIsGeneratingDescription] = useState(false);
+
+    // New states for Pricing Strategy Generator
+    const [productNameForPricing, setProductNameForPricing] = useState('');
+    const [productCost, setProductCost] = useState('');
+    const [targetAudience, setTargetAudience] = useState('');
+    const [pricingStrategySuggestion, setPricingStrategySuggestion] = useState('');
+    const [isGeneratingPricingStrategy, setIsGeneratingPricingStrategy] = useState(false);
+
+
+    // Function to display messages
+    const showMessage = (msg, type) => {
+        setMessage(msg);
+        setMessageType(type);
+        setTimeout(() => {
+            setMessage('');
+            setMessageType('');
+        }, 5000); // Clear message after 5 seconds
+    };
+
+    // Authenticate user and set up Firestore listeners
+    useEffect(() => {
+        const setupAuthAndFirestore = async () => {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Error al autenticar:", error);
+                showMessage(`Error al iniciar sesión: ${error.message}`, 'error');
+            }
+        };
+
+        const unsubscribe = onAuthStateChanged(auth, (user) => {
+            if (user) {
+                setUserId(user.uid);
+                setIsAuthenticated(true);
+                setIsLoading(false);
+            } else {
+                setUserId(null);
+                setIsAuthenticated(false);
+                setIsLoading(false);
+                setupAuthAndFirestore(); // Try to sign in if not authenticated
+            }
+        });
+
+        return () => unsubscribe(); // Cleanup auth listener on unmount
+    }, []);
+
+    // Set up Firestore listeners for sales and expenses
+    useEffect(() => {
+        if (!isAuthenticated || !userId) return;
+
+        // Collections for user-specific data in Firestore
+        // Path: artifacts/{appId}/users/{userId}/sales
+        const salesColRef = collection(db, `artifacts/${appId}/users/${userId}/sales`);
+        // Path: artifacts/{appId}/users/{userId}/expenses
+        const expensesColRef = collection(db, `artifacts/${appId}/users/${userId}/expenses`);
+
+        // Listen for real-time updates to sales data
+        const unsubscribeSales = onSnapshot(salesColRef, (snapshot) => {
+            const fetchedSales = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            // Sort sales by date in descending order for display
+            setSales(fetchedSales.sort((a, b) => new Date(b.date) - new Date(a.date)));
+        }, (error) => {
+            console.error("Error al escuchar ventas:", error);
+            showMessage(`Error al cargar ventas: ${error.message}`, 'error');
+        });
+
+        // Listen for real-time updates to expenses data
+        const unsubscribeExpenses = onSnapshot(expensesColRef, (snapshot) => {
+            const fetchedExpenses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            // Sort expenses by date in descending order for display
+            setExpenses(fetchedExpenses.sort((a, b) => new Date(b.date) - new Date(a.date)));
+        }, (error) => {
+            console.error("Error al escuchar gastos:", error);
+            showMessage(`Error al cargar gastos: ${error.message}`, 'error');
+        });
+
+        // Cleanup listeners on component unmount
+        return () => {
+            unsubscribeSales();
+            unsubscribeExpenses();
+        };
+    }, [isAuthenticated, userId]); // Dependencies for this useEffect
+
+    // Save exchange rate to localStorage whenever it changes
+    useEffect(() => {
+        localStorage.setItem('exchangeRate', exchangeRate.toString());
+    }, [exchangeRate]);
+
+    // Function to handle adding a new sale to Firestore
+    const handleAddSale = async (e) => {
+        e.preventDefault();
+        if (!saleDate || !saleProduct || !saleQuantity || !saleAmount || !userId) {
+            showMessage('Por favor, completa todos los campos de venta.', 'error');
+            return;
+        }
+
+        const newSale = {
+            date: saleDate,
+            product: saleProduct,
+            quantity: parseFloat(saleQuantity),
+            amount: parseFloat(saleAmount),
+            currency: saleCurrency,
+            timestamp: new Date() // Add a timestamp for internal ordering/tracking
+        };
+
+        try {
+            await addDoc(collection(db, `artifacts/${appId}/users/${userId}/sales`), newSale);
+            showMessage('Venta agregada exitosamente.', 'success');
+            // Clear form fields after successful addition
+            setSaleDate('');
+            setSaleProduct('');
+            setSaleQuantity('');
+            setSaleAmount('');
+            setSaleCurrency('USD');
+        } catch (error) {
+            console.error("Error al agregar venta:", error);
+            showMessage(`Error al agregar venta: ${error.message}`, 'error');
+        }
+    };
+
+    // Function to handle adding a new expense to Firestore
+    const handleAddExpense = async (e) => {
+        e.preventDefault();
+        if (!expenseDate || !expenseCategory || !expenseAmount || !userId) {
+            showMessage('Por favor, completa todos los campos de gasto.', 'error');
+            return;
+        }
+
+        const newExpense = {
+            date: expenseDate,
+            category: expenseCategory,
+            amount: parseFloat(expenseAmount),
+            currency: expenseCurrency,
+            timestamp: new Date() // Add a timestamp for internal ordering/tracking
+        };
+
+        try {
+            await addDoc(collection(db, `artifacts/${appId}/users/${userId}/expenses`), newExpense);
+            showMessage('Gasto agregado exitosamente.', 'success');
+            // Clear form fields after successful addition
+            setExpenseDate('');
+            setExpenseCategory('');
+            setExpenseAmount('');
+            setExpenseCurrency('USD');
+        } catch (error) {
+            console.error("Error al agregar gasto:", error);
+            showMessage(`Error al agregar gasto: ${error.message}`, 'error');
+        }
+    };
+
+    // Function to delete a sale from Firestore
+    const handleDeleteSale = async (id) => {
+        try {
+            await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/sales`, id));
+            showMessage('Venta eliminada.', 'success');
+        } catch (error) {
+            console.error("Error al eliminar venta:", error);
+            showMessage(`Error al eliminar venta: ${error.message}`, 'error');
+        }
+    };
+
+    // Function to delete an expense from Firestore
+    const handleDeleteExpense = async (id) => {
+        try {
+            await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/expenses`, id));
+            showMessage('Gasto eliminado.', 'success');
+        } catch (error) {
+            console.error("Error al eliminar gasto:", error);
+            showMessage(`Error al eliminar gasto: ${error.message}`, 'error');
+        }
+    };
+
+    // Helper function to convert amount to USD based on current exchange rate
+    const convertToUSD = useCallback((amount, currency) => {
+        if (currency === 'VES') {
+            return exchangeRate > 0 ? amount / exchangeRate : 0;
+        }
+        return amount;
+    }, [exchangeRate]);
+
+    // Helper function to convert amount to VES based on current exchange rate
+    const convertToVES = useCallback((amount, currency) => {
+        if (currency === 'USD') {
+            return amount * exchangeRate;
+        }
+        return amount;
+    }, [exchangeRate]);
+
+    // Calculate total sales in USD
+    const totalSalesUSD = sales.reduce((acc, sale) => acc + (convertToUSD(sale.amount, sale.currency) * sale.quantity), 0);
+    // Calculate total sales in VES
+    const totalSalesVES = sales.reduce((acc, sale) => acc + (convertToVES(sale.amount, sale.currency) * sale.quantity), 0);
+
+    // Calculate total expenses in USD
+    const totalExpensesUSD = expenses.reduce((acc, expense) => acc + convertToUSD(expense.amount, expense.currency), 0);
+    // Calculate total expenses in VES
+    const totalExpensesVES = expenses.reduce((acc, expense) => acc + convertToVES(expense.amount, expense.currency), 0);
+
+    // Calculate net profit in USD
+    const netProfitUSD = totalSalesUSD - totalExpensesUSD;
+    // Calculate net profit in VES
+    const netProfitVES = totalSalesVES - totalExpensesVES;
+
+    // Function to generate sales insights using Gemini API
+    const generateSalesInsights = async () => {
+        if (sales.length === 0) {
+            showMessage('No hay datos de ventas para generar ideas.', 'error');
+            setSalesInsights('No hay datos de ventas para generar ideas. Agrega algunas ventas para empezar.');
+            return;
+        }
+
+        setIsGeneratingInsights(true);
+        setSalesInsights('Generando ideas de ventas... por favor espera.');
+
+        // Prepare the sales data for the LLM prompt
+        const salesDataForLLM = sales.map(sale => ({
+            date: sale.date,
+            product: sale.product,
+            quantity: sale.quantity,
+            amount: sale.amount,
+            currency: sale.currency,
+            totalUSD: (convertToUSD(sale.amount, sale.currency) * sale.quantity).toFixed(2),
+            totalVES: (convertToVES(sale.amount, sale.currency) * sale.quantity).toFixed(2)
+        }));
+
+        const prompt = `Analiza los siguientes datos de ventas de mi negocio y proporciona un resumen conciso de mi rendimiento de ventas. Incluye:
+        1.  Rendimiento general de ventas en USD y VES.
+        2.  Identifica los 3 productos/servicios más vendidos según el monto total.
+        3.  Cualquier tendencia o patrón notable (ej., aumento/disminución reciente de ventas, productos específicos que se venden bien en ciertas fechas).
+        4.  Sugerencias para mejorar las ventas o los esfuerzos de marketing basándote en estos datos.
+
+        Tasa de Cambio Actual (VES/USD): ${exchangeRate}
+        Ventas Totales USD: ${totalSalesUSD.toFixed(2)}
+        Ventas Totales VES: ${totalSalesVES.toFixed(2)}
+
+        Datos de Ventas (Fecha, Producto, Cantidad, Monto Unitario, Moneda Original, Total en USD, Total en VES):
+        ${JSON.stringify(salesDataForLLM, null, 2)}
+
+        Por favor, responde de forma amigable y profesional, en español.`;
+
+        try {
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = ""; // If you want to use models other than gemini-2.0-flash or imagen-3.0-generate-002, provide an API key here. Otherwise, leave this as-is.
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setSalesInsights(text);
+                showMessage('Ideas de ventas generadas con éxito.', 'success');
+            } else {
+                setSalesInsights('No se pudieron generar las ideas de ventas. Por favor, inténtalo de nuevo.');
+                showMessage('Error al generar ideas de ventas.', 'error');
+                console.error("Error al obtener respuesta del LLM:", result);
+            }
+        } catch (error) {
+            setSalesInsights('Ocurrió un error al conectar con el servicio. Por favor, inténtalo de nuevo más tarde.');
+            showMessage(`Error de conexión: ${error.message}`, 'error');
+            console.error("Error en la llamada a la API de Gemini:", error);
+        } finally {
+            setIsGeneratingInsights(false);
+        }
+    };
+
+    // Function to generate product description using Gemini API
+    const handleGenerateProductDescription = async () => {
+        if (!productKeywords.trim()) {
+            showMessage('Por favor, ingresa algunas palabras clave para el producto.', 'error');
+            setProductDescription('Ingresa algunas palabras clave para generar una descripción.');
+            return;
+        }
+
+        setIsGeneratingDescription(true);
+        setProductDescription('Generando descripción... por favor espera.');
+
+        const prompt = `Genera una descripción de producto atractiva y creativa, de aproximadamente 3-5 oraciones, utilizando las siguientes palabras clave e ideas: "${productKeywords}".
+        Asegúrate de que la descripción sea persuasiva y resalte los beneficios. Responde en español.`;
+
+        try {
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = ""; // If you want to use models other than gemini-2.0-flash or imagen-3.0-generate-002, provide an API key here. Otherwise, leave this as-is.
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setProductDescription(text);
+                showMessage('Descripción de producto generada con éxito.', 'success');
+            } else {
+                setProductDescription('No se pudo generar la descripción. Por favor, inténtalo de nuevo.');
+                showMessage('Error al generar descripción de producto.', 'error');
+                console.error("Error al obtener respuesta del LLM para descripción:", result);
+            }
+        } catch (error) {
+            setProductDescription('Ocurrió un error al conectar con el servicio. Por favor, inténtalo de nuevo más tarde.');
+            showMessage(`Error de conexión: ${error.message}`, 'error');
+            console.error("Error en la llamada a la API de Gemini para descripción:", error);
+        } finally {
+            setIsGeneratingDescription(false);
+        }
+    };
+
+    // Function to generate pricing strategy using Gemini API
+    const handleGeneratePricingStrategy = async () => {
+        if (!productNameForPricing.trim() || !productCost || !targetAudience.trim()) {
+            showMessage('Por favor, completa todos los campos para generar la estrategia de precios.', 'error');
+            setPricingStrategySuggestion('Completa todos los campos para generar una estrategia de precios.');
+            return;
+        }
+
+        setIsGeneratingPricingStrategy(true);
+        setPricingStrategySuggestion('Generando estrategia de precios... por favor espera.');
+
+        const prompt = `Soy un negocio que vende "${productNameForPricing}". El costo de producción o adquisición de este producto es de ${productCost} USD. Mi público objetivo es: "${targetAudience}".
+
+        Considerando estos datos, por favor, sugiere al menos 3 estrategias de precios detalladas. Para cada estrategia, incluye:
+        1.  El nombre de la estrategia (ej. Precio de Penetración).
+        2.  Una breve descripción de la estrategia.
+        3.  Cómo aplicarla a mi producto específico con el costo dado.
+        4.  Ventajas y desventajas para mi negocio y público objetivo.
+        5.  Un precio sugerido o rango de precios en USD.
+
+        Responde de forma clara, estructurada y profesional, en español.`;
+
+        try {
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            const apiKey = ""; // If you want to use models other than gemini-2.0-flash or imagen-3.0-generate-002, provide an API key here. Otherwise, leave this as-is.
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setPricingStrategySuggestion(text);
+                showMessage('Estrategia de precios generada con éxito.', 'success');
+            } else {
+                setPricingStrategySuggestion('No se pudo generar la estrategia de precios. Por favor, inténtalo de nuevo.');
+                showMessage('Error al generar estrategia de precios.', 'error');
+                console.error("Error al obtener respuesta del LLM para estrategia de precios:", result);
+            }
+        } catch (error) {
+            setPricingStrategySuggestion('Ocurrió un error al conectar con el servicio. Por favor, inténtalo de nuevo más tarde.');
+            showMessage(`Error de conexión: ${error.message}`, 'error');
+            console.error("Error en la llamada a la API de Gemini para estrategia de precios:", error);
+        } finally {
+            setIsGeneratingPricingStrategy(false);
+        }
+    };
+
+
+    // Show loading state while authentication and initial data fetch is in progress
+    if (isLoading) {
+        return (
+            <div className="flex justify-center items-center h-screen bg-gray-100">
+                <div className="text-xl font-semibold text-gray-700">Cargando...</div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gray-100 flex flex-col items-center p-4 sm:p-6 lg:p-8 font-inter">
+            {/* Message display for success/error alerts */}
+            {message && (
+                <div className={`fixed top-4 right-4 p-3 rounded-lg shadow-lg text-white z-50 ${messageType === 'success' ? 'bg-green-500' : 'bg-red-500'}`}>
+                    {message}
+                </div>
+            )}
+
+            <div className="w-full max-w-6xl bg-white rounded-xl shadow-lg p-6 sm:p-8 lg:p-10 mb-8">
+                <h1 className="text-3xl sm:text-4xl font-bold text-center text-gray-800 mb-6">
+                    Gestor de Ventas y Presupuesto
+                </h1>
+
+                {/* User ID and Exchange Rate Section */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                    <div className="bg-blue-50 p-4 rounded-lg shadow-sm">
+                        <p className="text-lg font-semibold text-blue-700 mb-2">ID de Usuario:</p>
+                        <p className="break-words text-gray-800 text-sm md:text-base">{userId || 'No autenticado'}</p>
+                        <p className="text-sm text-gray-600 mt-2">Este ID asegura que tus datos no se pierdan.</p>
+                    </div>
+
+                    <div className="bg-yellow-50 p-4 rounded-lg shadow-sm">
+                        <label htmlFor="exchangeRate" className="block text-lg font-semibold text-yellow-700 mb-2">
+                            Tasa de Cambio (VES/USD):
+                        </label>
+                        <input
+                            type="number"
+                            id="exchangeRate"
+                            value={exchangeRate}
+                            onChange={(e) => setExchangeRate(parseFloat(e.target.value) || 0)}
+                            placeholder="Ej: 36.5"
+                            min="0"
+                            step="0.01"
+                            className="w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 text-gray-800"
+                        />
+                        <p className="text-sm text-gray-600 mt-2">
+                            Actualiza este valor diariamente con la tasa de cambio actual (ej. BCV).
+                        </p>
+                    </div>
+                </div>
+
+                {/* Summary Section - Displays total sales, expenses, and net profit */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">Resumen General</h2>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <div className="bg-green-100 p-4 rounded-lg shadow-md flex flex-col justify-between">
+                            <h3 className="text-lg font-medium text-green-800">Total Ventas</h3>
+                            <p className="text-2xl font-bold text-green-700 mt-2">
+                                ${totalSalesUSD.toFixed(2)} USD
+                            </p>
+                            <p className="text-lg text-green-600">
+                                Bs. {totalSalesVES.toFixed(2)} VES
+                            </p>
+                        </div>
+                        <div className="bg-red-100 p-4 rounded-lg shadow-md flex flex-col justify-between">
+                            <h3 className="text-lg font-medium text-red-800">Total Gastos</h3>
+                            <p className="text-2xl font-bold text-red-700 mt-2">
+                                ${totalExpensesUSD.toFixed(2)} USD
+                            </p>
+                            <p className="text-lg text-red-600">
+                                Bs. {totalExpensesVES.toFixed(2)} VES
+                            </p>
+                        </div>
+                        <div className={`p-4 rounded-lg shadow-md flex flex-col justify-between ${netProfitUSD >= 0 ? 'bg-blue-100' : 'bg-purple-100'}`}>
+                            <h3 className="text-lg font-medium text-blue-800">Ganancia/Pérdida Neta</h3>
+                            <p className={`text-2xl font-bold mt-2 ${netProfitUSD >= 0 ? 'text-blue-700' : 'text-purple-700'}`}>
+                                ${netProfitUSD.toFixed(2)} USD
+                            </p>
+                            <p className={`text-lg ${netProfitVES >= 0 ? 'text-blue-600' : 'text-purple-600'}`}>
+                                Bs. {netProfitVES.toFixed(2)} VES
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <hr className="my-8 border-gray-300" />
+
+                {/* Add Sale Form */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">Registrar Venta</h2>
+                    <form onSubmit={handleAddSale} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <div>
+                            <label htmlFor="saleDate" className="block text-sm font-medium text-gray-700">Fecha:</label>
+                            <input
+                                type="date"
+                                id="saleDate"
+                                value={saleDate}
+                                onChange={(e) => setSaleDate(e.target.value)}
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="saleProduct" className="block text-sm font-medium text-gray-700">Producto/Servicio:</label>
+                            <input
+                                type="text"
+                                id="saleProduct"
+                                value={saleProduct}
+                                onChange={(e) => setSaleProduct(e.target.value)}
+                                placeholder="Nombre del producto"
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="saleQuantity" className="block text-sm font-medium text-gray-700">Cantidad:</label>
+                            <input
+                                type="number"
+                                id="saleQuantity"
+                                value={saleQuantity}
+                                onChange={(e) => setSaleQuantity(e.target.value)}
+                                placeholder="1"
+                                min="0"
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="saleAmount" className="block text-sm font-medium text-gray-700">Monto Unitario:</label>
+                            <input
+                                type="number"
+                                id="saleAmount"
+                                value={saleAmount}
+                                onChange={(e) => setSaleAmount(e.target.value)}
+                                placeholder="Ej: 25.00"
+                                min="0"
+                                step="0.01"
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="saleCurrency" className="block text-sm font-medium text-gray-700">Moneda:</label>
+                            <select
+                                id="saleCurrency"
+                                value={saleCurrency}
+                                onChange={(e) => setSaleCurrency(e.target.value)}
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            >
+                                <option value="USD">USD</option>
+                                <option value="VES">VES</option>
+                            </select>
+                        </div>
+                        <div className="md:col-span-2 lg:col-span-1 flex items-end">
+                            <button
+                                type="submit"
+                                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+                            >
+                                Añadir Venta
+                            </button>
+                        </div>
+                    </form>
+                </div>
+
+                <hr className="my-8 border-gray-300" />
+
+                {/* Add Expense Form */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">Registrar Gasto</h2>
+                    <form onSubmit={handleAddExpense} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <div>
+                            <label htmlFor="expenseDate" className="block text-sm font-medium text-gray-700">Fecha:</label>
+                            <input
+                                type="date"
+                                id="expenseDate"
+                                value={expenseDate}
+                                onChange={(e) => setExpenseDate(e.target.value)}
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="expenseCategory" className="block text-sm font-medium text-gray-700">Categoría:</label>
+                            <input
+                                type="text"
+                                id="expenseCategory"
+                                value={expenseCategory}
+                                onChange={(e) => setExpenseCategory(e.target.value)}
+                                placeholder="Ej: Materia prima, Transporte"
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="expenseAmount" className="block text-sm font-medium text-gray-700">Monto:</label>
+                            <input
+                                type="number"
+                                id="expenseAmount"
+                                value={expenseAmount}
+                                onChange={(e) => setExpenseAmount(e.target.value)}
+                                placeholder="Ej: 15.00"
+                                min="0"
+                                step="0.01"
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="expenseCurrency" className="block text-sm font-medium text-gray-700">Moneda:</label>
+                            <select
+                                id="expenseCurrency"
+                                value={expenseCurrency}
+                                onChange={(e) => setExpenseCurrency(e.target.value)}
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                            >
+                                <option value="USD">USD</option>
+                                <option value="VES">VES</option>
+                            </select>
+                        </div>
+                        <div className="md:col-span-2 lg:col-span-1 flex items-end">
+                            <button
+                                type="submit"
+                                className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-md shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+                            >
+                                Añadir Gasto
+                            </button>
+                        </div>
+                    </form>
+                </div>
+
+                <hr className="my-8 border-gray-300" />
+
+                {/* Sales Insights Section */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">Ideas de Ventas ✨</h2>
+                    <button
+                        onClick={generateSalesInsights}
+                        disabled={isGeneratingInsights || sales.length === 0}
+                        className={`w-full mb-4 py-2 px-4 rounded-md shadow-md transition duration-300 ease-in-out transform ${
+                            (isGeneratingInsights || sales.length === 0) ? 'bg-gray-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700'
+                        } text-white font-bold hover:scale-105`}
+                    >
+                        {isGeneratingInsights ? 'Generando...' : 'Generar Ideas de Ventas ✨'}
+                    </button>
+                    {salesInsights && (
+                        <div className="bg-purple-50 p-4 rounded-lg shadow-sm mt-4 whitespace-pre-wrap text-gray-800">
+                            {salesInsights}
+                        </div>
+                    )}
+                </div>
+
+                <hr className="my-8 border-gray-300" />
+
+                {/* Product Description Generator Section */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">Generador de Descripciones de Productos ✨</h2>
+                    <div className="mb-4">
+                        <label htmlFor="productKeywords" className="block text-sm font-medium text-gray-700">Palabras clave del producto:</label>
+                        <textarea
+                            id="productKeywords"
+                            value={productKeywords}
+                            onChange={(e) => setProductKeywords(e.target.value)}
+                            placeholder="Ej: Zapatos deportivos, ligeros, cómodos, para correr, diseño moderno"
+                            rows="3"
+                            className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-green-500 focus:border-green-500"
+                        ></textarea>
+                    </div>
+                    <button
+                        onClick={handleGenerateProductDescription}
+                        disabled={isGeneratingDescription || !productKeywords.trim()}
+                        className={`w-full py-2 px-4 rounded-md shadow-md transition duration-300 ease-in-out transform ${
+                            (isGeneratingDescription || !productKeywords.trim()) ? 'bg-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'
+                        } text-white font-bold hover:scale-105`}
+                    >
+                        {isGeneratingDescription ? 'Generando...' : 'Generar Descripción ✨'}
+                    </button>
+                    {productDescription && (
+                        <div className="bg-green-50 p-4 rounded-lg shadow-sm mt-4 whitespace-pre-wrap text-gray-800">
+                            {productDescription}
+                        </div>
+                    )}
+                </div>
+
+                <hr className="my-8 border-gray-300" />
+
+                {/* Pricing Strategy Generator Section */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">Generador de Estrategias de Precios ✨</h2>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label htmlFor="productNameForPricing" className="block text-sm font-medium text-gray-700">Nombre del Producto:</label>
+                            <input
+                                type="text"
+                                id="productNameForPricing"
+                                value={productNameForPricing}
+                                onChange={(e) => setProductNameForPricing(e.target.value)}
+                                placeholder="Ej: Camisa de lino"
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-yellow-500 focus:border-yellow-500"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="productCost" className="block text-sm font-medium text-gray-700">Costo (USD):</label>
+                            <input
+                                type="number"
+                                id="productCost"
+                                value={productCost}
+                                onChange={(e) => setProductCost(parseFloat(e.target.value) || '')}
+                                placeholder="Ej: 10.50"
+                                min="0"
+                                step="0.01"
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-yellow-500 focus:border-yellow-500"
+                            />
+                        </div>
+                        <div className="md:col-span-2">
+                            <label htmlFor="targetAudience" className="block text-sm font-medium text-gray-700">Público Objetivo:</label>
+                            <textarea
+                                id="targetAudience"
+                                value={targetAudience}
+                                onChange={(e) => setTargetAudience(e.target.value)}
+                                placeholder="Ej: Jóvenes adultos, preocupados por la moda y la sostenibilidad"
+                                rows="2"
+                                className="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-yellow-500 focus:border-yellow-500"
+                            ></textarea>
+                        </div>
+                    </div>
+                    <button
+                        onClick={handleGeneratePricingStrategy}
+                        disabled={isGeneratingPricingStrategy || !productNameForPricing.trim() || !productCost || !targetAudience.trim()}
+                        className={`w-full py-2 px-4 rounded-md shadow-md transition duration-300 ease-in-out transform ${
+                            (isGeneratingPricingStrategy || !productNameForPricing.trim() || !productCost || !targetAudience.trim()) ? 'bg-gray-400 cursor-not-allowed' : 'bg-yellow-600 hover:bg-yellow-700'
+                        } text-white font-bold hover:scale-105`}
+                    >
+                        {isGeneratingPricingStrategy ? 'Generando...' : 'Generar Estrategia de Precios ✨'}
+                    </button>
+                    {pricingStrategySuggestion && (
+                        <div className="bg-yellow-50 p-4 rounded-lg shadow-sm mt-4 whitespace-pre-wrap text-gray-800">
+                            {pricingStrategySuggestion}
+                        </div>
+                    )}
+                </div>
+
+                <hr className="my-8 border-gray-300" />
+
+                {/* Sales List */}
+                <div className="mb-8">
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">Historial de Ventas</h2>
+                    {sales.length === 0 ? (
+                        <p className="text-gray-600">No hay ventas registradas aún.</p>
+                    ) : (
+                        <div className="overflow-x-auto rounded-lg shadow-md">
+                            <table className="min-w-full bg-white border-collapse">
+                                <thead className="bg-gray-200">
+                                    <tr>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Fecha</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Producto</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Cantidad</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Monto Original</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Total USD</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Total VES</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Acciones</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-200">
+                                    {sales.map((sale) => (
+                                        <tr key={sale.id} className="hover:bg-gray-50">
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">{sale.date}</td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">{sale.product}</td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">{sale.quantity}</td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                                                {sale.amount.toFixed(2)} {sale.currency}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                                                ${(convertToUSD(sale.amount, sale.currency) * sale.quantity).toFixed(2)}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                                                Bs. {(convertToVES(sale.amount, sale.currency) * sale.quantity).toFixed(2)}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm font-medium">
+                                                <button
+                                                    onClick={() => handleDeleteSale(sale.id)}
+                                                    className="text-red-600 hover:text-red-900 transition duration-150 ease-in-out"
+                                                >
+                                                    Eliminar
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                </div>
+
+                <hr className="my-8 border-gray-300" />
+
+                {/* Expenses List */}
+                <div>
+                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">Historial de Gastos</h2>
+                    {expenses.length === 0 ? (
+                        <p className="text-gray-600">No hay gastos registrados aún.</p>
+                    ) : (
+                        <div className="overflow-x-auto rounded-lg shadow-md">
+                            <table className="min-w-full bg-white border-collapse">
+                                <thead className="bg-gray-200">
+                                    <tr>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Fecha</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Categoría</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Monto Original</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Monto USD</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Monto VES</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">Acciones</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-200">
+                                    {expenses.map((expense) => (
+                                        <tr key={expense.id} className="hover:bg-gray-50">
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">{expense.date}</td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">{expense.category}</td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                                                {expense.amount.toFixed(2)} {expense.currency}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                                                ${convertToUSD(expense.amount, expense.currency).toFixed(2)}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                                                Bs. {convertToVES(expense.amount, expense.currency).toFixed(2)}
+                                            </td>
+                                            <td className="px-4 py-3 whitespace-nowrap text-sm font-medium">
+                                                <button
+                                                    onClick={() => handleDeleteExpense(expense.id)}
+                                                    className="text-red-600 hover:text-red-900 transition duration-150 ease-in-out"
+                                                >
+                                                    Eliminar
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default App;
